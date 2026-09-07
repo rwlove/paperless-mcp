@@ -2,7 +2,9 @@
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import express from "express";
+import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
 import {
   createMcpServer,
@@ -91,24 +93,59 @@ async function main() {
     // Store transports for each session
     const sseTransports: Record<string, SSEServerTransport> = {};
 
+    // Stateful Streamable HTTP: one transport + server per session, keyed by
+    // Mcp-Session-Id. The Kuadrant mcp-gateway broker negotiates 2025-11-25
+    // (stateful) and drops any upstream that runs stateless (empty session,
+    // GET /mcp -> 405). SDK >=1.30 negotiates 2025-11-25 natively, so no
+    // protocol shim is needed — only a real session + notification stream.
+    // workaround: https://github.com/Kuadrant/mcp-gateway/issues/1419 — return
+    // to a stateless transport when the broker recovers stale sessions itself.
+    const httpTransports: Record<string, StreamableHTTPServerTransport> = {};
+
     app.post("/mcp", async (req, res) => {
-      const requestToken = getBearerToken(req, {
-        fallbackToken: resolvedToken,
-        allowAnonymous: noAuth,
-      });
-      if (!requestToken) {
-        sendUnauthorized(res);
-        return;
-      }
-      try {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      let transport = sessionId ? httpTransports[sessionId] : undefined;
+
+      if (!transport) {
+        if (sessionId || !isInitializeRequest(req.body)) {
+          // A non-initialize request must carry a known session id.
+          res.status(400).json({
+            jsonrpc: "2.0",
+            error: {
+              code: -32000,
+              message: "Bad Request: No valid session ID provided",
+            },
+            id: null,
+          });
+          return;
+        }
+
+        const requestToken = getBearerToken(req, {
+          fallbackToken: resolvedToken,
+          allowAnonymous: noAuth,
+        });
+        if (!requestToken) {
+          sendUnauthorized(res);
+          return;
+        }
+
+        const newTransport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid) => {
+            httpTransports[sid] = newTransport;
+          },
+        });
+        newTransport.onclose = () => {
+          if (newTransport.sessionId) {
+            delete httpTransports[newTransport.sessionId];
+          }
+        };
         const server = buildServer(requestToken);
-        const transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: undefined,
-        });
-        res.on("close", () => {
-          transport.close();
-        });
-        await server.connect(transport);
+        await server.connect(newTransport);
+        transport = newTransport;
+      }
+
+      try {
         await transport.handleRequest(req, res, req.body);
       } catch (error) {
         console.error("Error handling MCP request:", error);
@@ -125,31 +162,23 @@ async function main() {
       }
     });
 
-    app.get("/mcp", async (req, res) => {
-      res.writeHead(405).end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Method not allowed.",
-          },
-          id: null,
-        })
-      );
-    });
+    // GET (server->client notification stream) and DELETE (session teardown)
+    // are served from the existing session's transport.
+    const handleSessionRequest = async (
+      req: express.Request,
+      res: express.Response
+    ) => {
+      const sessionId = req.headers["mcp-session-id"] as string | undefined;
+      const transport = sessionId ? httpTransports[sessionId] : undefined;
+      if (!transport) {
+        res.status(400).send("Invalid or missing session ID");
+        return;
+      }
+      await transport.handleRequest(req, res);
+    };
 
-    app.delete("/mcp", async (req, res) => {
-      res.writeHead(405).end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          error: {
-            code: -32000,
-            message: "Method not allowed.",
-          },
-          id: null,
-        })
-      );
-    });
+    app.get("/mcp", handleSessionRequest);
+    app.delete("/mcp", handleSessionRequest);
 
     app.get("/sse", async (req, res) => {
       console.log("SSE request received");
@@ -197,7 +226,7 @@ async function main() {
 
     app.listen(resolvedPort, () => {
       console.log(
-        `MCP Stateless Streamable HTTP Server listening on port ${resolvedPort}`
+        `MCP Stateful Streamable HTTP Server listening on port ${resolvedPort}`
       );
     });
     // await new Promise((resolve) => setTimeout(resolve, 1000000));
